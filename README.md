@@ -1,28 +1,42 @@
 # Apex Legends Character Detection System
 
-This service uses computer vision to detect Apex Legends characters from gameplay screenshots using Celery task queues.
+This service uses computer vision to detect Apex Legends characters from gameplay screenshots using Redis task queues and Python workers.
 
 ## Architecture
 
 ```
-C# API (Nucleus.Apex)
+API / Client Application
   ↓ (queues task via Redis)
-Celery Worker (Python)
+Python Worker (worker.py)
   ↓ (downloads screenshots & runs CV detection)
-Redis (stores results)
+Redis (stores results with TTL)
   ↑ (polls for results)
-C# Background Service
+Client Application
 ```
 
 ## How It Works
 
-1. **DetectionEndpoints.cs** - API receives clip ID + screenshot URLs
-2. **DetectionQueueService.cs** - Creates Celery task and pushes to Redis queue
-3. **tasks.py** - Celery worker picks up task from Redis
-4. **detector.py** - Downloads screenshots, extracts portrait region, compares against references
-5. **tasks.py** - Stores result back in Redis with 7-day TTL
-6. **DetectionBackgroundService.cs** - Polls Redis every 5 seconds for completed tasks
-7. **ApexStatements.cs** - Updates database with detected character
+1. **Client Application** - Queues detection task to Redis with clip ID + screenshot URLs
+2. **worker.py** - Worker picks up task from `apex_detection_queue` using blocking pop
+3. **detector.py** - Downloads screenshots asynchronously, extracts portrait region, compares against references
+4. **worker.py** - Stores result back in Redis at `result:{task_id}` with 7-day TTL
+5. **Client Application** - Polls Redis for completed task results
+
+## Components
+
+### detector.py
+The core computer vision module that handles:
+- **Async Image Downloading**: Uses aiohttp for concurrent screenshot downloads
+- **Image Processing**: Resizes to 1080p and extracts portrait regions using OpenCV
+- **Template Matching**: Compares extracted portraits against reference images using multiple algorithms
+- **Confidence Scoring**: Averages scores from three different matching methods for robust detection
+
+### worker.py
+The Redis queue worker that:
+- **Queue Processing**: Blocks on Redis queue (`brpop`) for incoming tasks
+- **Task Execution**: Coordinates detection using the ApexDetector class
+- **Result Storage**: Stores formatted results in Redis with TTL
+- **Statistics Tracking**: Maintains daily counters for completed/failed tasks
 
 ## Portrait Setup
 
@@ -48,50 +62,91 @@ Filenames should match character names (case-insensitive, underscores/hyphens co
 - `Mad_Maggie.png` → "mad maggie"
 - `Bloodhound.png` → "bloodhound"
 
+## Deployment
+
+### Using Docker
+
+```bash
+# Build the image
+docker build -t apex-legend-detector .
+
+# Run the worker
+docker run -d \
+  --name apex-legend-detector \
+  -e REDIS_URL=redis://redis:6379/0 \
+  -e LOG_LEVEL=INFO \
+  -e MIN_CONFIDENCE=0.44 \
+  -v apex_portraits:/app/portraits \
+  apex-legend-detector
+```
+
+### Local Development
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Set environment variables
+export REDIS_URL=redis://localhost:6379/0
+export LOG_LEVEL=INFO
+
+# Run the worker
+python worker.py
+```
+
+### Dependencies
+
+- **redis** - Redis client for queue and result storage
+- **aiohttp** - Async HTTP client for downloading screenshots
+- **opencv-python-headless** - Computer vision library for template matching
+- **numpy** - Numerical computing for image processing
+- **pydantic** - Data validation for request/response models
+
 ## Configuration
 
 ### Environment Variables
 
-**apex-legend-detector service:**
-- `REDIS_URL` - Redis connection string (default: `redis://redis:6379/0`)
+- `REDIS_URL` - Redis connection string (default: `redis://localhost:6379/0`)
 - `LOG_LEVEL` - Logging level (default: `INFO`)
-- `PORTRAIT_REGION` - Screenshot crop region as `x,y,w,h` (default: `80,955,92,74`)
-- `MIN_CONFIDENCE` - Minimum confidence threshold 0-1 (default: `0.7`)
-
-**nucleus-apex service:**
-- `RedisConnectionString` - Redis host:port (default: `redis:6379`)
+- `PORTRAIT_REGION` - Screenshot crop region as `x,y,w,h` (default: `90,955,77,66`)
+- `MIN_CONFIDENCE` - Minimum confidence threshold 0-1 (default: `0.44`)
 
 ## Detection Algorithm
 
-1. **Download** screenshot from provided URL
-2. **Extract** portrait region at coordinates (80, 955) with size 92x74
-3. **Compare** extracted portrait against all reference portraits using:
+1. **Download** screenshots asynchronously from provided URLs using aiohttp
+2. **Resize** images to 1080p if necessary (maintaining aspect ratio)
+3. **Extract** portrait region at configured coordinates (default: 90, 955, 77x66)
+4. **Compare** extracted portrait against all reference portraits using:
    - Template Matching (TM_CCOEFF_NORMED)
    - Correlation (TM_CCORR_NORMED)
    - Squared Difference (TM_SQDIFF_NORMED)
-4. **Average** scores from all three methods
-5. **Return** best match if confidence ≥ 0.7
+5. **Average** scores from all three methods
+6. **Return** best match across all screenshots if confidence ≥ configured threshold
 
-## API Usage
+## Usage
 
 ### Queue Detection Task
 
-```http
-POST /api/apexdetection/enqueue
-Content-Type: application/json
+Push a task to the Redis queue `apex_detection_queue`:
 
-{
-  "clipId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-  "screenshotUrls": [
-    "https://cdn.example.com/screenshot1.jpg",
-    "https://cdn.example.com/screenshot2.jpg"
-  ]
+```python
+import redis
+import json
+import uuid
+
+redis_client = redis.from_url('redis://localhost:6379/0')
+
+task = {
+    'task_id': str(uuid.uuid4()),
+    'clip_id': '3fa85f64-5717-4562-b3fc-2c963f66afa6',
+    'screenshot_urls': [
+        'https://cdn.example.com/screenshot1.jpg',
+        'https://cdn.example.com/screenshot2.jpg'
+    ]
 }
-```
 
-**Limits:**
-- Maximum 10 screenshots per request
-- Task timeout: 300 seconds
+redis_client.lpush('apex_detection_queue', json.dumps(task))
+```
 
 ### Detection Result Structure
 
@@ -107,10 +162,15 @@ Results stored in Redis at `result:{taskId}`:
       "CharacterName": "Wraith",
       "Confidence": 0.92,
       "ScreenshotIndex": 0,
-      "ScreenshotUrl": "https://..."
+      "ScreenshotUrl": "https://cdn.example.com/screenshot1.jpg"
     }
   ],
-  "BestOverall": { ... },
+  "BestOverall": {
+    "CharacterName": "Wraith",
+    "Confidence": 0.92,
+    "ScreenshotIndex": 0,
+    "ScreenshotUrl": "https://cdn.example.com/screenshot1.jpg"
+  },
   "UniqueCharacters": ["Wraith"],
   "TotalScreenshots": 2,
   "SuccessfulDetections": 1,
@@ -119,21 +179,9 @@ Results stored in Redis at `result:{taskId}`:
 }
 ```
 
-## Database Schema
-
-```sql
-CREATE TABLE apex_clip_detection (
-    clip_id UUID PRIMARY KEY,
-    task_id UUID,
-    status INTEGER,              -- 0=NotStarted, 1=InProgress, 2=Completed, 3=Failed
-    primary_detection INTEGER,   -- ApexLegend enum value
-    secondary_detection INTEGER
-);
-```
-
 ## Monitoring
 
-### Check Celery Worker Status
+### Check Worker Status
 
 ```bash
 docker logs -f apex-legend-detector
@@ -165,9 +213,10 @@ docker exec -it redis redis-cli GET "stats:failed:2025-01-09"
 - Verify PNG files in volume: `docker exec apex-legend-detector ls -la /app/portraits`
 
 **Tasks not processing:**
-- Verify Celery worker running: `docker ps | grep apex-legend-detector`
-- Check Redis connectivity: `docker exec apex-legend-detector redis-cli -h redis ping`
-- Check queue: `docker exec redis redis-cli LLEN apex_detection_queue`
+- Verify worker running: `docker ps | grep apex-legend-detector`
+- Check worker logs: `docker logs apex-legend-detector`
+- Check Redis connectivity: Test with `redis-cli -h redis ping`
+- Check queue: `redis-cli LLEN apex_detection_queue`
 
 **Low confidence scores:**
 - Adjust `MIN_CONFIDENCE` environment variable (lower = more permissive)
@@ -175,6 +224,6 @@ docker exec -it redis redis-cli GET "stats:failed:2025-01-09"
 - Ensure reference portraits are high quality and well-lit
 
 **Character not detected:**
-- Check character name mapping in `ApexLegend.cs`
-- Ensure portrait PNG filename matches character name
+- Ensure portrait PNG filename matches character name exactly
 - Review logs for "Loaded portrait for {name}" messages
+- Verify the portrait reference images are high quality

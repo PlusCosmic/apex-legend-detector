@@ -7,10 +7,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY apex-legend-detector/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY apex-legend-detector/detector.py apex-legend-detector/worker.py ./
-COPY apex-legend-detector/portraits/ /app/portraits/
+COPY detector.py worker.py ./
+COPY portraits/ /app/portraits/
 
 CMD ["python", "-u", "worker.py"]
